@@ -1,0 +1,81 @@
+# =========================
+# Python
+# =========================
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+*.so
+*.egg
+*.egg-info/
+dist/
+build/
+
+# =========================
+# Virtual environments
+# =========================
+venv/
+.env/
+.venv/
+env/
+
+# =========================
+# Jupyter
+# =========================
+.ipynb_checkpoints/
+
+# =========================
+# VSCode / IDE
+# =========================
+.vscode/
+.idea/
+
+# =========================
+# OS files
+# =========================
+.DS_Store
+Thumbs.db
+
+# =========================
+# Logs
+# =========================
+*.log
+
+# =========================
+# Data (VERY IMPORTANT)
+# =========================
+Datasets/
+
+# Large raw files
+*.csv
+*.parquet
+*.npy
+*.npz
+
+# =========================
+# Artifacts / Outputs
+# =========================
+artifacts/
+outputs/
+
+# Model / scaler files
+*.joblib
+*.pkl
+
+# Plots / images
+*.png
+*.jpg
+*.jpeg
+
+# =========================
+# Config secrets (if any)
+# =========================
+.env
+*.env
+
+# =========================
+# Misc
+# =========================
+*.tmp
+*.bak
+*.swp
