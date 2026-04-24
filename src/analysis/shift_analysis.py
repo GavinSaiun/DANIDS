@@ -1,3 +1,4 @@
+import argparse
 import json
 from pathlib import Path
 
@@ -271,72 +272,190 @@ def assign_tertiles(values_dict, atol=1e-12):
     return levels
 
 
-def classify_shift_type(metric_levels, pair_metrics, label_eps=1e-6):
-    global_level = metric_levels["global_feature_shift"]
-    cov_level = metric_levels["covariance_shift"]
-    label_level = metric_levels["label_shift"]
-    cond_level = metric_levels["class_conditional_shift"]
+def level_from_thresholds(value: float, low_cut: float, high_cut: float) -> str:
+    if value < low_cut:
+        return "low"
+    if value < high_cut:
+        return "medium"
+    return "high"
 
-    pair_name = pair_metrics["pair_name"]
 
-    g = global_level[pair_name]
-    c = cov_level[pair_name]
-    l = label_level[pair_name]
-    cc = cond_level[pair_name]
+def classify_shift_absolute(pair_metrics):
+    """
+    Absolute rule-based shift classification.
 
-    # Use the actual label-shift metric as a guard.
-    # In your balanced_100k setup this will usually be zero.
-    label_abs_diff = pair_metrics["label_shift"]["absolute_attack_prior_difference"]
-    has_real_label_shift = label_abs_diff > label_eps
+    These thresholds are practical thresholds for this NetFlow setup.
+    They are not universal laws. They make the classification reproducible
+    and independent of which other dataset pairs are included.
 
-    if has_real_label_shift and l == "high" and g in {"low", "medium"} and cc in {"low", "medium"}:
+    Definitions:
+    - Covariate shift: P(X) changes strongly, especially feature/covariance structure.
+    - Label shift: P(Y) changes.
+    - Class-conditional shift: P(X|Y) changes, suggesting class structure / boundary changes.
+    - Mixed shift: multiple shift signals are present.
+    - Mild shift: all shift signals are low.
+    """
+    global_w = pair_metrics["wasserstein"]["clipped_mean"]
+    domain_auroc = pair_metrics["domain_classifier"]["auroc"]
+    cov_log_ratio = pair_metrics["covariance_shift"]["mean_absolute_log10_variance_ratio"]
+    label_diff = pair_metrics["label_shift"]["absolute_attack_prior_difference"]
+
+    class_cond = pair_metrics["class_conditional_shift"]["summary"][
+        "overall_class_conditional_shift_mean"
+    ]
+    if class_cond is None:
+        class_cond = 0.0
+
+    levels = {
+        "global_feature_shift": level_from_thresholds(
+            global_w,
+            low_cut=0.50,
+            high_cut=1.50,
+        ),
+        "domain_separability": level_from_thresholds(
+            domain_auroc,
+            low_cut=0.70,
+            high_cut=0.90,
+        ),
+        "covariance_shift": level_from_thresholds(
+            cov_log_ratio,
+            low_cut=1.00,
+            high_cut=1.50,
+        ),
+        "label_shift": level_from_thresholds(
+            label_diff,
+            low_cut=0.05,
+            high_cut=0.20,
+        ),
+        "class_conditional_shift": level_from_thresholds(
+            class_cond,
+            low_cut=0.50,
+            high_cut=1.50,
+        ),
+    }
+
+    has_label_shift = label_diff >= 0.05
+
+    global_high = levels["global_feature_shift"] == "high"
+    global_med_or_high = levels["global_feature_shift"] in {"medium", "high"}
+
+    cov_high = levels["covariance_shift"] == "high"
+    cov_med_or_high = levels["covariance_shift"] in {"medium", "high"}
+
+    class_cond_high = levels["class_conditional_shift"] == "high"
+    class_cond_med_or_high = levels["class_conditional_shift"] in {"medium", "high"}
+
+    domain_high = levels["domain_separability"] == "high"
+
+    # Mild only when all key signals are genuinely low.
+    if (
+        levels["global_feature_shift"] == "low"
+        and levels["class_conditional_shift"] == "low"
+        and levels["label_shift"] == "low"
+        and levels["domain_separability"] in {"low", "medium"}
+    ):
+        shift_type = "mild_shift"
+        recommendation = [
+            "source-only baseline may transfer reasonably",
+            "small fine-tuning budgets may be sufficient",
+        ]
+
+    # Label shift requires actual class-prior difference.
+    elif has_label_shift and levels["label_shift"] == "high":
         shift_type = "label_shift"
         recommendation = [
-            "prior correction / reweighting",
+            "class prior correction",
+            "loss reweighting",
             "feature alignment alone may be insufficient",
         ]
-    elif g == "high" and c == "high" and (not has_real_label_shift) and cc in {"medium", "high"}:
+
+    # Covariate shift: strong feature/covariance shift, but not strong class-conditional shift.
+    elif (global_high or cov_high or domain_high) and not class_cond_high:
         shift_type = "covariate_shift"
         recommendation = [
             "Deep CORAL",
             "MMD",
             "DANN",
         ]
-    elif cc == "high" and (not has_real_label_shift):
+
+    # Class-conditional shift: class-specific distributions change strongly.
+    elif class_cond_high and not (global_high and cov_high):
         shift_type = "class_conditional_shift"
         recommendation = [
-            "DANN",
+            "fine-tuning with small target budgets",
             "replay-based adaptation",
             "boundary-critical replay",
         ]
-    elif g == "high" or c == "high" or cc == "high" or (has_real_label_shift and l == "high"):
+
+    # Mixed shift: multiple shift signals are present.
+    elif (
+        (global_med_or_high and class_cond_med_or_high)
+        or (cov_med_or_high and class_cond_med_or_high)
+        or (domain_high and class_cond_med_or_high)
+    ):
         shift_type = "mixed_shift"
         recommendation = [
             "DANN",
             "Deep CORAL",
-            "boundary-critical replay",
+            "replay-based continual learning",
         ]
+
     else:
         shift_type = "mild_shift"
         recommendation = [
-            "source-only baseline may already transfer reasonably",
-            "naive fine-tuning",
+            "source-only baseline may transfer reasonably",
+            "small fine-tuning budgets may be sufficient",
         ]
 
     return {
         "shift_type": shift_type,
-        "level_summary": {
-            "global_feature_shift": g,
-            "covariance_shift": c,
-            "label_shift": "low" if not has_real_label_shift else l,
-            "class_conditional_shift": cc,
+        "level_summary": levels,
+        "absolute_thresholds": {
+            "global_feature_shift_clipped_wasserstein": {
+                "low": "< 0.50",
+                "medium": "0.50-1.50",
+                "high": ">= 1.50",
+            },
+            "domain_classifier_auroc": {
+                "low": "< 0.70",
+                "medium": "0.70-0.90",
+                "high": ">= 0.90",
+            },
+            "covariance_mean_abs_log10_variance_ratio": {
+                "low": "< 1.00",
+                "medium": "1.00-1.50",
+                "high": ">= 1.50",
+            },
+            "label_prior_difference": {
+                "low": "< 0.05",
+                "medium": "0.05-0.20",
+                "high": ">= 0.20",
+            },
+            "class_conditional_wasserstein": {
+                "low": "< 0.50",
+                "medium": "0.50-1.50",
+                "high": ">= 1.50",
+            },
         },
         "recommended_adaptation_methods": recommendation,
     }
 
+
 def main():
-    base_dir = PAIR_DIR / "balanced_100k"
+    parser = argparse.ArgumentParser()
+    parser.add_argument(
+        "--stage1_variant",
+        default="balanced_100k",
+        type=str,
+        help="Example: balanced_10k, balanced_25k, balanced_50k, balanced_100k, full",
+    )
+    args = parser.parse_args()
+
+    base_dir = PAIR_DIR / args.stage1_variant
     feature_names = load_feature_names()
+
+    if not base_dir.exists():
+        raise FileNotFoundError(f"Pair directory not found: {base_dir}")
 
     results = {}
 
@@ -357,7 +476,7 @@ def main():
 
         print("Global clipped Wasserstein mean:", w_stats["clipped_mean"])
         print("Domain classifier AUROC:", domain_stats["auroc"])
-        print("Covariance Frobenius norm:", cov_stats["frobenius_norm"])
+        print("Covariance log-var ratio:", cov_stats["mean_absolute_log10_variance_ratio"])
         print("Attack prior abs difference:", label_stats["absolute_attack_prior_difference"])
         print(
             "Class-conditional shift mean:",
@@ -376,38 +495,8 @@ def main():
             "class_conditional_shift": conditional_stats,
         }
 
-    # second pass: classify all pairs relative to one another
-    global_feature_values = {
-        pair_name: pair_metrics["wasserstein"]["clipped_mean"]
-        for pair_name, pair_metrics in results.items()
-    }
-    covariance_values = {
-        pair_name: pair_metrics["covariance_shift"]["frobenius_norm"]
-        for pair_name, pair_metrics in results.items()
-    }
-    label_shift_values = {
-        pair_name: pair_metrics["label_shift"]["absolute_attack_prior_difference"]
-        for pair_name, pair_metrics in results.items()
-    }
-    class_conditional_values = {
-        pair_name: (
-            pair_metrics["class_conditional_shift"]["summary"]["overall_class_conditional_shift_mean"]
-            if pair_metrics["class_conditional_shift"]["summary"]["overall_class_conditional_shift_mean"] is not None
-            else 0.0
-        )
-        for pair_name, pair_metrics in results.items()
-    }
-
-    metric_levels = {
-        "global_feature_shift": assign_tertiles(global_feature_values),
-        "covariance_shift": assign_tertiles(covariance_values),
-        "label_shift": assign_tertiles(label_shift_values),
-        "class_conditional_shift": assign_tertiles(class_conditional_values),
-    }
-
     for pair_name, pair_metrics in results.items():
-        classification = classify_shift_type(metric_levels, pair_metrics)
-        pair_metrics["shift_classification"] = classification
+        pair_metrics["shift_classification"] = classify_shift_absolute(pair_metrics)
 
     summary_path = base_dir / "shift_summary.json"
     with open(summary_path, "w", encoding="utf-8") as f:
@@ -417,4 +506,5 @@ def main():
 
 
 if __name__ == "__main__":
+    import argparse
     main()

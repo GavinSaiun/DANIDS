@@ -19,15 +19,36 @@ from src.data.preprocess import (
 )
 
 
+BALANCED_SAMPLE_SIZES = [10_000, 25_000, 50_000, 100_000]
+
+
 def make_balanced_subset(
     X_df: pd.DataFrame,
     y: np.ndarray,
     attack: pd.Series,
     max_per_class: int | None,
     random_state: int,
-) -> tuple[pd.DataFrame, np.ndarray, pd.Series]:
+) -> tuple[pd.DataFrame, np.ndarray, pd.Series, dict]:
+    """
+    Stratified random sampling by binary class.
+
+    This creates a fair controlled subset by:
+    - sampling benign and attack flows separately
+    - using the same max_per_class rule for each dataset
+    - using a fixed random seed for reproducibility
+    - preserving a 50/50 benign/attack class balance where possible
+    """
     if max_per_class is None:
-        return X_df, y, attack
+        sampling_meta = {
+            "sampling_strategy": "full_dataset",
+            "max_per_class": None,
+            "random_state": random_state,
+            "benign_available": int((y == 0).sum()),
+            "attack_available": int((y == 1).sum()),
+            "benign_selected": int((y == 0).sum()),
+            "attack_selected": int((y == 1).sum()),
+        }
+        return X_df, y, attack, sampling_meta
 
     y_series = pd.Series(y, name="Label")
     benign_idx = y_series[y_series == 0].index.to_numpy()
@@ -43,15 +64,30 @@ def make_balanced_subset(
     selected_idx = np.concatenate([benign_sample, attack_sample])
     rng.shuffle(selected_idx)
 
+    sampling_meta = {
+        "sampling_strategy": "stratified_random_balanced_binary",
+        "max_per_class": int(max_per_class),
+        "random_state": int(random_state),
+        "benign_available": int(len(benign_idx)),
+        "attack_available": int(len(attack_idx)),
+        "benign_selected": int(benign_take),
+        "attack_selected": int(attack_take),
+        "total_selected": int(len(selected_idx)),
+        "fairness_definition": (
+            "Same feature space, same class-balance rule, same random sampling procedure, "
+            "same random seed, and same downstream split protocol for every dataset."
+        ),
+    }
+
     return (
         X_df.iloc[selected_idx].reset_index(drop=True),
         y[selected_idx],
         attack.iloc[selected_idx].reset_index(drop=True),
+        sampling_meta,
     )
 
 
 def main():
-    # Shared schema from your inspection is already matched, but this rechecks in code.
     common_features = get_common_feature_columns(
         dataset_paths=DATASET_PATHS,
         drop_columns=DROP_COLUMNS,
@@ -61,16 +97,28 @@ def main():
     summary = {
         "common_feature_count": len(common_features),
         "common_feature_columns": common_features,
+        "sampling_variants": {
+            "full": {
+                "description": "Full cleaned dataset. Keeps original class distribution.",
+            },
+            **{
+                f"balanced_{n // 1000}k": {
+                    "description": (
+                        f"Stratified random balanced subset with up to {n} benign "
+                        f"and {n} attack samples per dataset."
+                    ),
+                    "max_per_class": n,
+                    "random_state": RANDOM_STATE,
+                }
+                for n in BALANCED_SAMPLE_SIZES
+            },
+        },
         "datasets": {},
     }
 
     feature_path = STAGE1_DIR / "common_features.json"
     with open(feature_path, "w", encoding="utf-8") as f:
         json.dump(summary, f, indent=2)
-
-    # Set this to None if you want full cleaned datasets.
-    # For practical first runs, 100_000 per class is a good starting point.
-    max_per_class = 100_000
 
     for dataset_name, path in DATASET_PATHS.items():
         print(f"\nProcessing {dataset_name}")
@@ -85,33 +133,56 @@ def main():
             attack_column=ATTACK_COLUMN,
         )
 
-        # Keep only shared features and fixed order
         X_df = X_df[common_features].copy()
+
+        dataset_summary = {
+            "full_rows": int(len(X_df)),
+            "full_benign": int((y == 0).sum()),
+            "full_attack": int((y == 1).sum()),
+            "variants": {},
+        }
 
         # Save full cleaned dataset
         full_dir = STAGE1_DIR / "full"
         save_stage1_dataset(full_dir, dataset_name, X_df, y, attack)
 
-        # Save balanced subset for quick experiments
-        subset_X, subset_y, subset_attack = make_balanced_subset(
-            X_df=X_df,
-            y=y,
-            attack=attack,
-            max_per_class=max_per_class,
-            random_state=RANDOM_STATE,
-        )
-
-        subset_dir = STAGE1_DIR / "balanced_100k"
-        save_stage1_dataset(subset_dir, dataset_name, subset_X, subset_y, subset_attack)
-
-        summary["datasets"][dataset_name] = {
-            "full_rows": int(len(X_df)),
-            "full_benign": int((y == 0).sum()),
-            "full_attack": int((y == 1).sum()),
-            "subset_rows": int(len(subset_X)),
-            "subset_benign": int((subset_y == 0).sum()),
-            "subset_attack": int((subset_y == 1).sum()),
+        dataset_summary["variants"]["full"] = {
+            "rows": int(len(X_df)),
+            "benign": int((y == 0).sum()),
+            "attack": int((y == 1).sum()),
+            "sampling_strategy": "full_dataset",
         }
+
+        # Save multiple balanced subsets for sampling sensitivity
+        for max_per_class in BALANCED_SAMPLE_SIZES:
+            variant_name = f"balanced_{max_per_class // 1000}k"
+            print(f"Creating {variant_name} for {dataset_name}")
+
+            subset_X, subset_y, subset_attack, sampling_meta = make_balanced_subset(
+                X_df=X_df,
+                y=y,
+                attack=attack,
+                max_per_class=max_per_class,
+                random_state=RANDOM_STATE,
+            )
+
+            subset_dir = STAGE1_DIR / variant_name
+            save_stage1_dataset(
+                subset_dir,
+                dataset_name,
+                subset_X,
+                subset_y,
+                subset_attack,
+            )
+
+            dataset_summary["variants"][variant_name] = {
+                "rows": int(len(subset_X)),
+                "benign": int((subset_y == 0).sum()),
+                "attack": int((subset_y == 1).sum()),
+                "sampling": sampling_meta,
+            }
+
+        summary["datasets"][dataset_name] = dataset_summary
 
     with open(STAGE1_DIR / "stage1_summary.json", "w", encoding="utf-8") as f:
         json.dump(summary, f, indent=2)

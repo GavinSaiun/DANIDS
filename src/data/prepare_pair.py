@@ -130,6 +130,16 @@ def main():
         "target": args.target,
         "stage1_variant": args.stage1_variant,
         "random_state": RANDOM_STATE,
+        "split_protocol": {
+            "source": "train/val/test = 70/15/15, stratified by binary label",
+            "target": "adapt/test = 20/80, stratified by binary label",
+            "leakage_control": [
+                "Source test is never used for training or model selection.",
+                "Target test is never used for training or model selection.",
+                "Scaler is fitted on source train only.",
+                "The same held-out source test set is used before and after adaptation to measure forgetting.",
+            ],
+        },
         "source_split_sizes": {
             "train": int(len(scaled["ys_train"])),
             "val": int(len(scaled["ys_val"])),
@@ -138,6 +148,13 @@ def main():
         "target_split_sizes": {
             "adapt": int(len(scaled["yt_adapt"])),
             "test": int(len(scaled["yt_test"])),
+        },
+        "class_distribution": {
+            "source_train_attack_rate": float((scaled["ys_train"] == 1).mean()),
+            "source_val_attack_rate": float((scaled["ys_val"] == 1).mean()),
+            "source_test_attack_rate": float((scaled["ys_test"] == 1).mean()),
+            "target_adapt_attack_rate": float((scaled["yt_adapt"] == 1).mean()),
+            "target_test_attack_rate": float((scaled["yt_test"] == 1).mean()),
         },
         "num_features": int(scaled["Xs_train"].shape[1]),
         "scaler": "StandardScaler fitted on source train only",
